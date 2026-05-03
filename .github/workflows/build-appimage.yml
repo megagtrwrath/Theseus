@@ -1,0 +1,340 @@
+name: Build UIX Desktop AppImage
+# Always builds latest commit! User Beware!
+
+# Default token permissions (principle of least privilege).
+permissions:
+  contents: read
+
+on:
+  # Manual trigger
+  workflow_dispatch
+    
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      theseus_version: ${{ steps.check.outputs.version }}
+      theseus_tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - name: Check latest Theseus release
+        id: check
+        run: |
+          set -euo pipefail
+
+          github_api_get() {
+            local url="$1"
+            local auth_args=()
+
+            # Prefer token to avoid rate limits.
+            if [ -n "${GITHUB_TOKEN:-}" ]; then
+              auth_args+=( -H "Authorization: Bearer ${GITHUB_TOKEN}" )
+            fi
+
+            curl -fsSL \
+              --retry 5 \
+              --retry-all-errors \
+              --retry-delay 2 \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'User-Agent: Theseus' \
+              "${auth_args[@]}" \
+              "$url"
+          }
+
+          resolve_latest_tag() {
+            local repo="$1"
+            local url="https://api.github.com/repos/${repo}/releases/latest"
+            local json tag msg
+
+            json="$(github_api_get "$url")" || return 1
+            tag="$(printf '%s' "$json" | jq -r '.tag_name // empty')"
+
+            if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+              msg="$(printf '%s' "$json" | jq -r '.message // empty' 2>/dev/null || true)"
+              echo "ERROR: GitHub API returned an empty tag_name for ${repo}." >&2
+              if [ -n "$msg" ]; then
+                echo "GitHub API message: $msg" >&2
+              fi
+              echo "Tip: ensure jq is available and consider setting GITHUB_TOKEN to avoid rate limits." >&2
+              return 2
+            fi
+
+            printf '%s\n' "$tag"
+          }
+
+          # Get latest Theseus release tag (retry + fail-fast on null)
+          LATEST_RELEASE="$(resolve_latest_tag MrMilenko/Theseus)"
+          echo "Latest Theseus release: $LATEST_RELEASE"
+
+          # Manual override
+          if [ "${{ github.event.inputs.theseus_version }}" != "" ] && [ "${{ github.event.inputs.theseus_version }}" != "latest" ]; then
+            LATEST_RELEASE="${{ github.event.inputs.theseus_version }}"
+            echo "Manual override to: $LATEST_RELEASE"
+          fi
+          
+          echo "version=${LATEST_RELEASE#Theseus-}" >> $GITHUB_OUTPUT
+          echo "tag=$LATEST_RELEASE" >> $GITHUB_OUTPUT
+        env:
+          # GitHub automatically provides this in Actions; used for higher API rate limits.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    needs: check-version
+    runs-on: ubuntu-24.04
+    name: Build UIX Desktop
+    
+    steps:
+      - name: Get current date
+        id: date
+        run: echo "::set-output name=date::$(date +'%Y-%m-%d')"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up build information
+        id: build_info
+        run: |
+          VERSION="${{ needs.check-version.outputs.Theseus_version }}"
+          TAG="${{ needs.check-version.outputs.Theseus_tag }}"
+          
+          # Fallback for push events
+          if [ -z "$VERSION" ]; then
+            VERSION=$(curl -s https://api.github.com/repos/MrMilenko/Theseus/releases/latest | jq -r '.tag_name' | sed 's/theseus-//')
+            TAG="UIX-Desktop-${VERSION}"
+          fi
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Building UIX Desktop $VERSION"
+      
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            binutils \
+            build-essential \
+            cmake \
+            git \
+            libegl1-mesa-dev \
+            libgl1-mesa-dev \
+            mingw-w64 \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            patchelf \
+            squashfs-tools \
+            libsdl2-dev \
+            libsdl2-mixer-dev \
+            libgl-dev \
+            libqt6svg6-dev \
+            libopencv-dev \
+            libproc2-dev \
+            wget \
+            file \
+            desktop-file-utils \
+            wine64-tools \
+            zsync
+            
+      - name: Clone and build UIX Desktop
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/MrMilenko/Theseus
+          cd ./theseus/build
+          make DESKTOP_DIR=/usr/bin desktop
+          # We now know where the executable is. theseus/build/desktop/
+      - name: Download linuxdeploy
+        run: |
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          wget -q https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x linuxdeploy*.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+      
+      - name: Prepare AppDir
+        run: |
+          set -euo pipefail
+          # Ensure proper directory structure
+          mkdir -p AppDir/usr/lib
+          
+          # Create desktop file if it doesn't exist
+          if [ ! -f AppDir/usr/share/applications/uix.desktop ]; then
+            mkdir -p AppDir/usr/share/applications
+            cat > AppDir/usr/share/applications/uix.desktop << 'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=UIX Desktop
+          GenericName=Dashboard
+          Comment=UIX Dashboard, for all your OGX Theming needs
+          Exec=theseus
+          Icon=theseus
+          Categories=Utility;Game;
+          Terminal=false
+          EOF
+          fi
+          
+          # Find and copy icon
+          ICON_PATH=""
+
+          # icon in the cloned Theseus source tree
+          if [ -z "$ICON_PATH" ] && [ -d theseus ]; then
+            ICON_PATH="$(find theseus -type f \
+              \( -iname 'theseus.png' -o -iname 'theseus.svg' -o -iname 'theseus*.png' -o -iname 'theseus*.svg' \) \
+              2>/dev/null | head -n 1 || true)"
+          fi
+
+          if [ -n "$ICON_PATH" ]; then
+            ext="${ICON_PATH##*.}"
+            cp -v "$ICON_PATH" "AppDir/theseus.${ext}"
+            ln -sf "theseus.${ext}" AppDir/.DirIcon
+            echo "Using icon: $ICON_PATH"
+          else
+            echo "WARNING: Could not locate an UIX Desktop icon in source tree" >&2
+          fi
+
+          echo "Bundling OpenGL (GLVND) dispatcher libraries for portability..."
+          # Some minimal Ubuntu installs don't include libopengl0 by default.
+          # Bundling these dispatch libs is generally safe: they still use the host
+          # vendor GL implementation underneath (NVIDIA/Mesa) via GLVND.
+          ldconfig -p | awk '/\/libOpenGL\.so\.0$/{print $NF}' | head -n 1 \
+            | xargs -r -n 1 cp -v -t AppDir/usr/lib/ || true
+          ldconfig -p | awk '/\/libGLX\.so\.0$/{print $NF}' | head -n 1 \
+            | xargs -r -n 1 cp -v -t AppDir/usr/lib/ || true
+          ldconfig -p | awk '/\/libGLdispatch\.so\.0$/{print $NF}' | head -n 1 \
+            | xargs -r -n 1 cp -v -t AppDir/usr/lib/ || true
+          ldconfig -p | awk '/\/libEGL\.so\.1$/{print $NF}' | head -n 1 \
+            | xargs -r -n 1 cp -v -t AppDir/usr/lib/ || true
+
+          # Provide a deterministic AppRun that forces bundled libs/plugins.
+          # IMPORTANT: linuxdeploy's --custom-apprun copies the file into AppDir/AppRun.
+          # If the source path is already AppDir/AppRun, linuxdeploy can end up trying to
+          # copy AppDir/AppRun -> AppDir/AppRun (after removing the destination), which fails.
+          # Keep the custom AppRun outside AppDir and pass that path to linuxdeploy.
+          CUSTOM_APPRUN="$GITHUB_WORKSPACE/Theseus-AppRun"
+          cat > "$CUSTOM_APPRUN" <<'EOF'
+          #!/bin/sh
+          set -eu
+
+          APPDIR="$(dirname "$(readlink -f "$0")")"
+          export APPDIR
+
+          export PATH="$APPDIR/usr/bin${PATH:+:$PATH}"
+          export LD_LIBRARY_PATH="$APPDIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export XDG_DATA_DIRS="$APPDIR/usr/share${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
+
+          exec "$APPDIR/usr/bin/theseus" "$@"
+          EOF
+          chmod +x "$CUSTOM_APPRUN"
+          install -m 0755 "$CUSTOM_APPRUN" AppDir/AppRun
+
+      - name: Build AppImage
+        run: |
+          set -euo pipefail
+          # Avoid requiring FUSE on the runner when executing AppImages.
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          export VERSION="${{ steps.build_info.outputs.version }}"
+
+          CUSTOM_APPRUN="$GITHUB_WORKSPACE/theseus-AppRun"
+          if [ ! -x "$CUSTOM_APPRUN" ]; then
+            echo "ERROR: Expected custom AppRun at $CUSTOM_APPRUN (missing or not executable)." >&2
+            exit 1
+          fi
+
+          # linuxdeploy-plugin-qt expects Qt tools like qmlimportscanner on PATH.
+          export PATH="/usr/lib/qt6/bin:/usr/lib/x86_64-linux-gnu/qt6/bin:$PATH"
+
+          # Ensure linuxdeploy-plugin-qt uses Qt6's qmake.
+          if command -v qmake6 >/dev/null 2>&1; then
+            export QMAKE="$(command -v qmake6)"
+          elif command -v qt6-qmake >/dev/null 2>&1; then
+            export QMAKE="$(command -v qt6-qmake)"
+          fi
+          
+          LINUXDEPLOY_LOG="$GITHUB_WORKSPACE/linuxdeploy.log"
+          echo "Running linuxdeploy (logging to: $LINUXDEPLOY_LOG)"
+
+          icon_args=()
+          if [ -f AppDir/theseus.png ]; then
+            icon_args+=( --icon-file AppDir/theseus.png )
+          elif [ -f AppDir/theseus.svg ]; then
+            icon_args+=( --icon-file AppDir/theseus.svg )
+          fi
+
+          exclude_args=()
+
+          if ! ./linuxdeploy-x86_64.AppImage \
+            --appdir AppDir \
+            --output appimage \
+            --desktop-file AppDir/usr/share/applications/uix.desktop \
+            --executable AppDir/usr/bin/theseus \
+            --custom-apprun "$CUSTOM_APPRUN" \
+            "${exclude_args[@]}" \
+            "${icon_args[@]}" 2>&1 | tee "$LINUXDEPLOY_LOG"; then
+            echo "" >&2
+            echo "linuxdeploy failed. Last 200 log lines:" >&2
+            tail -n 200 "$LINUXDEPLOY_LOG" >&2 || true
+            echo "" >&2
+            echo "Diagnostics:" >&2
+            command -v mksquashfs >&2 && mksquashfs -version 2>&1 | head -n 5 >&2 || true
+            command -v patchelf >&2 && patchelf --version 2>&1 | head -n 5 >&2 || true
+            exit 1
+          fi
+           # Rename to include flavor + version
+          mv UIX-Desktop-*.AppImage UIX-Desktop--x86_64.AppImage
+          ;;
+          esac
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: UIX-Desktop-${{ steps.date.outputs.date }}
+          path: UIX-Desktop-${{ steps.date.outputs.date }}-*.AppImage
+
+  release:
+    needs: [check-version, build]
+    # if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: UIX-Desktop-*
+          merge-multiple: true
+          path: dist
+
+      - name: Create or update Release (idempotent)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          REPO="$GH_REPO"
+          TS="$(date -u +%Y%m%d-%H%M%SZ)"
+          NOTES_FILE="$RUNNER_TEMP/release-notes.md"
+
+          cat > "$NOTES_FILE" <<'EOF'
+          # UIX Desktop AppImages
+
+          Built from Theseus tag `${{ needs.check-version.outputs.Theseus_tag }}`.
+
+          ## Flavors
+          - `UIX Theseus` - Reverse Engineered Xbox Dashboard with new features!
+          - `UIX Desktop` - Reverse Engineered Xbox Dashboard, now on PC!
+          - `UIX Desktop AppImage` - Reverse Engineered Xbox Dashboard, now *mostly* compatible with most Linux distros!
+          EOF
+
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; updating title/notes."
+            gh release edit "$TAG" --repo "$REPO" --title "$TITLE" --notes-file "$NOTES_FILE"
+          else
+            echo "Creating new release $TAG."
+            gh release create "$TAG" --repo "$REPO" --title "$TITLE" --notes-file "$NOTES_FILE" --target "$GITHUB_SHA"
+          fi
+
+          echo "Uploading artifacts to $TAG (clobber if they already exist)..."
+          ls -la dist || true
+          gh release upload "$TAG" --repo "$REPO" dist/*.AppImage --clobber
